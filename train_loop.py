@@ -7,9 +7,13 @@ import detectron2.utils.comm as comm
 from detectron2.utils.events import get_event_storage
 from detectron2.engine.train_loop import SimpleTrainer, AMPTrainer
 from detectron2.data.common import AspectRatioGroupedDataset, MapDataset
-from detectron2.data.samplers import TrainingSampler, RandomSubsetTrainingSampler
+from detectron2.data.samplers import TrainingSampler, RandomSubsetTrainingSampler, InferenceSampler
 
-from .distributed_sampler import EpochTrainingSampler, RandomSubsetEpochTrainingSampler
+from .distributed_sampler import (
+    EpochTrainingSampler,
+    RandomSubsetEpochTrainingSampler,
+    RandomSubsetInferenceSampler,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +57,13 @@ def parse_dataloader(
             f" the DataLoader object from within trainer.data_loader"
         )
 
-    sampler = pytorch_dataloader.dataset.sampler
+    if hasattr(pytorch_dataloader.dataset, "sampler"):
+        sampler = pytorch_dataloader.dataset.sampler
+    elif hasattr(pytorch_dataloader.batch_sampler, "sampler"):
+        sampler = pytorch_dataloader.batch_sampler.sampler
+    else:
+        raise RuntimeError(f"Failed to extract sampler from dataloader")
+
     steps_per_epoch: Union[int, float]
     if type(sampler) == TrainingSampler:
         # Infinite sampler, not on epoch boundaries (so steps_per_epoch is float)
@@ -66,15 +76,15 @@ def parse_dataloader(
                 f" steps_per_epoch={steps_per_epoch}"
             )
         steps_per_epoch = int(steps_per_epoch)
+    elif type(sampler) in [InferenceSampler, RandomSubsetInferenceSampler]:
+        steps_per_epoch: float = len(sampler) / (batch_size * sampler._world_size)
     elif type(sampler) == RandomSubsetTrainingSampler:
         # Infinite sampler, not on epoch boundaries (so steps_per_epoch is float)
-        steps_per_epoch: float = sampler._size_subset / (
-            batch_size * sampler._world_size
-        )
+        steps_per_epoch: float = sampler._size_subset / (batch_size * sampler._world_size)
     else:
         raise NotImplementedError(f"Unexpected sampler type: {type(sampler)}.")
 
-    return steps_per_epoch, batch_size
+    return pytorch_dataloader, steps_per_epoch, batch_size
 
 
 class EpochTrainerMixin:
@@ -153,8 +163,7 @@ class EpochTrainerMixin:
 
             # average the rest metrics
             metrics_dict = {
-                k: np.mean([x[k] for x in all_metrics_dict])
-                for k in all_metrics_dict[0].keys()
+                k: np.mean([x[k] for x in all_metrics_dict]) for k in all_metrics_dict[0].keys()
             }
             total_losses_reduced = sum(metrics_dict.values())
             if not np.isfinite(total_losses_reduced):

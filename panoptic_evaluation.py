@@ -6,26 +6,24 @@ import logging
 import os
 import tempfile
 import time
+import multiprocessing
 from collections import OrderedDict
 
+import numpy as np
 from detectron2.utils import comm
 from detectron2.utils.file_io import PathManager
 from detectron2.evaluation import COCOPanopticEvaluator
 from detectron2.evaluation.panoptic_evaluation import _print_panoptic_results
 
 try:
-    from panopticapi.evaluation import pq_compute_multi_core
+    from panopticapi.evaluation import PQStat, pq_compute_single_core
 except ImportError as e:
-    raise ImportError(
-        f"Install panopticapi via `pip install panopticapi` and re-run.\n{e}"
-    )
+    raise ImportError(f"Install panopticapi via `pip install panopticapi` and re-run.\n{e}")
 
 logger = logging.getLogger(__name__)
 
 
-def pq_compute(
-    gt_json_file, pred_json_file, gt_folder=None, pred_folder=None, partial_eval=False
-):
+def pq_compute(gt_json_file, pred_json_file, gt_folder=None, pred_folder=None, partial_eval=False):
     """Modified from panopticapi.evaluation.py, pq_compute() to support partial evaluation"""
 
     start_time = time.time()
@@ -49,13 +47,9 @@ def pq_compute(
     print("\tJSON file: {}".format(pred_json_file))
 
     if not os.path.isdir(gt_folder):
-        raise Exception(
-            "Folder {} with ground truth segmentations doesn't exist".format(gt_folder)
-        )
+        raise Exception("Folder {} with ground truth segmentations doesn't exist".format(gt_folder))
     if not os.path.isdir(pred_folder):
-        raise Exception(
-            "Folder {} with predicted segmentations doesn't exist".format(pred_folder)
-        )
+        raise Exception("Folder {} with predicted segmentations doesn't exist".format(pred_folder))
 
     pred_annotations = {el["image_id"]: el for el in pred_json["annotations"]}
     matched_annotations_list = []
@@ -67,16 +61,12 @@ def pq_compute(
         elif not partial_eval:
             raise Exception("no prediction for the image with id: {}".format(image_id))
 
-    pq_stat = pq_compute_multi_core(
-        matched_annotations_list, gt_folder, pred_folder, categories
-    )
+    pq_stat = pq_compute_multi_core(matched_annotations_list, gt_folder, pred_folder, categories)
 
     metrics = [("All", None), ("Things", True), ("Stuff", False)]
     results = {}
     for name, isthing in metrics:
-        results[name], per_class_results = pq_stat.pq_average(
-            categories, isthing=isthing
-        )
+        results[name], per_class_results = pq_stat.pq_average(categories, isthing=isthing)
         if name == "All":
             results["per_class"] = per_class_results
     print("{:10s}| {:>5s}  {:>5s}  {:>5s} {:>5s}".format("", "PQ", "SQ", "RQ", "N"))
@@ -97,6 +87,29 @@ def pq_compute(
     print("Time elapsed: {:0.2f} seconds".format(t_delta))
 
     return results
+
+
+def pq_compute_multi_core(matched_annotations_list, gt_folder, pred_folder, categories):
+    """Modified from panopticapi.evaluation.py, pq_compute_multi_core() to add pool.close()/join()
+    which avoids "unexpectedly closed process" in VSCode and unnecessary SIGTERM warnings elsewhere.
+    """
+    cpu_num = multiprocessing.cpu_count()
+    annotations_split = np.array_split(matched_annotations_list, cpu_num)
+    print("Number of cores: {}, images per core: {}".format(cpu_num, len(annotations_split[0])))
+    workers = multiprocessing.Pool(processes=cpu_num)
+    processes = []
+    for proc_id, annotation_set in enumerate(annotations_split):
+        p = workers.apply_async(
+            pq_compute_single_core, (proc_id, annotation_set, gt_folder, pred_folder, categories)
+        )
+        processes.append(p)
+    pq_stat = PQStat()
+    for p in processes:
+        pq_stat += p.get()
+
+    workers.close()  # Added
+    workers.join()  # Added
+    return pq_stat
 
 
 class PartialCOCOPanopticEvaluator(COCOPanopticEvaluator):

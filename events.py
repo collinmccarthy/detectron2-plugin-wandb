@@ -1,65 +1,14 @@
 # Extension of https://github.com/SHI-Labs/OneFormer/blob/main/oneformer/utils/events.py
 import os
-import wandb
 import json
 import torch
 import re
 from typing import Dict, Any, Iterable, Union, List, Optional
-from collections import defaultdict
-from pathlib import Path
-from detectron2.utils import comm
 from detectron2.utils.events import (
-    EventWriter,
     JSONWriter,
     CommonMetricPrinter,
     get_event_storage,
 )
-
-
-def setup_wandb(cfg, args):
-    wandb_enabled = cfg.get("WANDB", {}).get("ENABLED", False)
-    wandb_restart = cfg.get("WANDB", {}).get("RESTART_RUN", False)
-    if comm.is_main_process() and wandb_enabled:
-        init_args = {
-            k.lower(): v for k, v in cfg.WANDB.items() if isinstance(k, str) and k not in ["config"]
-        }
-        init_args.pop("enabled")  # Not part of init, used for this fn and Trainer.build_writers()
-
-        output_dir = init_args.get("dir", None)
-        if output_dir is None:
-            raise RuntimeError(f"Missing wandb output dir. Set WANDB.DIR in config")
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-        # only include most related part to avoid too big table
-        # TODO: add configurable params to select which part of `cfg` should be saved in config
-        if "init_ignore_config" in init_args:
-            # Don't add config, just pop the key (not used by wandb.init(), only here)
-            init_args.pop("init_ignore_config")
-        elif "config_exclude_keys" in init_args:
-            init_args["config"] = cfg
-            init_args["config"]["d2_cfg_file"] = args.config_file
-        else:
-            init_args["config"] = {
-                "d2_model": cfg.MODEL,
-                "d2_solver": cfg.SOLVER,
-                "d2_cfg_file": args.config_file,
-            }
-        if ("name" not in init_args) or (init_args["name"] is None):
-            init_args["name"] = os.path.basename(args.config_file)
-
-        if wandb_restart and "resume" in init_args:
-            init_args["resume"] = False
-
-        wandb.init(**init_args)
-
-        # Save config file
-        # Have to rename, see issue
-        config = Path(output_dir, "config.yaml")  # Default detectron2 name
-        if config.exists():
-            renamed_config = config.with_name("config.yml")
-            renamed_config.unlink(missing_ok=True)
-            config.rename(renamed_config)
-            wandb.save(str(config), base_path=str(config.parent), policy="now")
 
 
 class BaseRule(object):
@@ -230,64 +179,6 @@ class EventWriterMixin:
         return scalars
 
 
-class CustomWandbWriter(EventWriterMixin, EventWriter):
-    """
-    Write all scalars to a tensorboard file.
-    """
-
-    def __init__(self, enabled: bool = True, *args, **kwargs):
-        """
-        Args:
-            log_dir (str): the directory to save the output events
-            kwargs: other arguments passed to `torch.utils.tensorboard.SummaryWriter(...)`
-        """
-        self._enabled = enabled
-        super().__init__(*args, **kwargs)
-
-    def write(self):
-        if not self._enabled:
-            return
-
-        storage = get_event_storage()
-        scalars_per_iter = self.get_new_scalars(wandb_writer=True)
-        for scalars in scalars_per_iter.values():
-            # storage.put_{image,histogram} is only meant to be used by
-            # tensorboard writer. So we access its internal fields directly from here.
-            if len(storage._vis_data) >= 1:
-                scalars["image"] = [
-                    wandb.Image(img, caption=img_name)
-                    for img_name, img, step_num in storage._vis_data
-                ]
-                # Storage stores all image data and rely on this writer to clear them.
-                # As a result it assumes only one writer will use its image data.
-                # An alternative design is to let storage store limited recent
-                # data (e.g. only the most recent image) that all writers can access.
-                # In that case a writer may not see all image data if its period is long.
-                storage.clear_images()
-
-            if len(storage._histograms) >= 1:
-
-                def create_bar(tag, bucket_limits, bucket_counts, **kwargs):
-                    data = [[label, val] for (label, val) in zip(bucket_limits, bucket_counts)]
-                    table = wandb.Table(data=data, columns=["label", "value"])
-                    return wandb.plot.bar(table, "label", "value", title=tag)
-
-                scalars["hist"] = [create_bar(**params) for params in storage._histograms]
-
-                storage.clear_histograms()
-
-            if len(scalars) == 0:
-                return
-
-            # Don't log with `step=storage_iter` so if we resume from an old step we don't get a
-            #   warning about overwriting history; we always add 'iter' key anyway to record step
-            wandb.log(scalars, commit=True)
-
-    def close(self):
-        if self._enabled:
-            wandb.finish()
-
-
 class CustomJSONWriter(EventWriterMixin, JSONWriter):
     """
     Update keys when logging to match wandb keys, in case we use json output.
@@ -332,10 +223,13 @@ class CustomCommonMetricPrinter(CommonMetricPrinter):
         except KeyError:
             avg_iter_time = None
             last_iter_time = None
-        try:
-            lr = "{:.5g}".format(storage.history("lr").latest())
-        except KeyError:
-            lr = "N/A"
+
+        lr_strs = [
+            "{}: {:.5g}".format(k, v.latest())
+            for k, v in storage.histories().items()
+            if k.endswith("lr")
+        ]
+        lrs = "  ".join(lr_strs) if len(lr_strs) > 0 else "lr: N/A"
 
         eta_string = self._get_eta(storage)
 
@@ -359,7 +253,7 @@ class CustomCommonMetricPrinter(CommonMetricPrinter):
             str.format(
                 " {eta}iter: {iter}  epoch: {epoch}  epoch_iter: {epoch_iter}"
                 + "  epoch_float: {epoch_float}  {losses}  {non_losses}  {avg_time}{last_time}"
-                + "{avg_data_time}{last_data_time} lr: {lr}  {memory}",
+                + "{avg_data_time}{last_data_time}  {lrs}  {memory}",
                 eta=f"eta: {eta_string}  " if eta_string else "",
                 iter=iteration,
                 epoch=epoch,
@@ -399,7 +293,7 @@ class CustomCommonMetricPrinter(CommonMetricPrinter):
                     if last_data_time is not None
                     else ""
                 ),
-                lr=lr,
+                lrs=lrs,
                 memory=("max_mem: {:.0f}M".format(max_mem_mb) if max_mem_mb is not None else ""),
             )
         )

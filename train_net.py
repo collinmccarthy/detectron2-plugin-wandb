@@ -1,13 +1,19 @@
 import os
+import re
 import weakref
 import logging
 import shutil
+import time
+import signal
 from pathlib import Path
 from argparse import Namespace
+from typing import Callable, Dict, Optional, Set
 
+import torch
+from torch.utils.data import DataLoader
 import detectron2.utils.comm as comm
 from detectron2.engine.defaults import create_ddp_model, DefaultTrainer, TrainerBase
-from detectron2.engine.hooks import PeriodicWriter, PeriodicCheckpointer
+from detectron2.engine.hooks import PeriodicWriter, PeriodicCheckpointer, LRScheduler
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.evaluation import DatasetEvaluators, COCOPanopticEvaluator, verify_results
 from detectron2.utils.logger import setup_logger
@@ -21,7 +27,7 @@ from mask2former import (
     MaskFormerSemanticDatasetMapper,
 )
 
-from .events import CustomWandbWriter, CustomJSONWriter, CustomCommonMetricPrinter
+from .events import CustomJSONWriter, CustomCommonMetricPrinter
 from .config import (
     update_config_epochs,
     get_config_value,
@@ -36,11 +42,15 @@ from .build import (
     build_detection_test_loader,
 )
 from .panoptic_evaluation import PartialCOCOPanopticEvaluator
+from .hooks import CustomLRScheduler
+from .wandb import CustomWandbWriter
 
 logger = logging.getLogger(__name__)
 
 
 class CustomTrainerMixin:
+    _dataloaders: Dict[str, DataLoader] = {}
+
     def __init__(self, cfg):
         """Same as train_net.py but uses CustomAMPTrainer instead of AMPTrainer and
         CustomSimpleTrainer instead of SimpleTrainer. Intended to be used as a mixin like:
@@ -59,7 +69,7 @@ class CustomTrainerMixin:
         data_loader = self.build_train_loader(cfg)
 
         # Update: Convert epoch-based to iter-based metrics
-        steps_per_epoch, batch_size = parse_dataloader(data_loader)
+        pytorch_data_loader, steps_per_epoch, batch_size = parse_dataloader(data_loader)
         update_config_epochs(cfg=cfg, steps_per_epoch=steps_per_epoch)
 
         # Assume these objects must be constructed in this order.
@@ -104,6 +114,99 @@ class CustomTrainerMixin:
 
         self.register_hooks(self.build_hooks())
 
+        self._optimizer_named_params: Optional[Dict[str, Dict]] = None
+        CustomTrainerMixin._dataloaders["train"] = pytorch_data_loader
+
+    @property
+    def optimizer_named_params(self) -> Dict[str, dict]:
+        if self._optimizer_named_params is None:
+            # Feature still doesn't exist, see https://github.com/pytorch/pytorch/issues/1489
+            # Iterate over named params just like mask2former.Trainer.build_optimizer()
+            param_idx = 0
+            optimizer_named_params = {}
+            for module_name, module in self._trainer.model.named_modules():
+                for module_param_name, value in module.named_parameters(recurse=False):
+                    full_name = f"{module_name}.{module_param_name}"
+                    params_dict = self._trainer.optimizer.param_groups[param_idx]
+                    assert len(params_dict["params"]) == 1 and id(params_dict["params"][0]) == id(
+                        value
+                    ), "Params and module tensor mismatch"
+
+                    optimizer_named_params[full_name] = params_dict  # Store orig params dict
+                    param_idx += 1
+
+            assert len(optimizer_named_params) == len(
+                self._trainer.optimizer.param_groups
+            ), "Missing named params"
+            self._optimizer_named_params = optimizer_named_params
+
+        return self._optimizer_named_params
+
+    def compute_unique_lr_groups(self) -> Dict[str, float]:
+        """
+        Iterate over optimizer params and return a dictionary of top-most keys and their current LRs
+
+        This is re-computed each iteration so the LR values are "current"
+        """
+        # Construct map for lr to named params
+        groups_to_lrs: Dict[str, Set[str]] = {}
+        for name, params in self.optimizer_named_params.items():
+            lr_str = str(params["lr"])  # Use string as key
+            split_name = name.split(".")
+            for idx in range(len(split_name)):
+                group_name = ".".join(split_name[: idx + 1])
+                if group_name not in groups_to_lrs:
+                    groups_to_lrs[group_name] = set()
+                groups_to_lrs[group_name].add(lr_str)
+
+        # Mark names to be removed if they are redundant (the "parent" prefix has only one lr value)
+        remove_names = []
+        for name in list(groups_to_lrs.keys()):
+            parent_name = ".".join(name.split(".")[:-1])
+            if parent_name in groups_to_lrs and len(groups_to_lrs[parent_name]) == 1:
+                remove_names.append(name)  # This param is "covered" by parent
+
+        unique_lr_groups: Dict[str, float] = {
+            name: float(next(iter(lr_vals)))  # Use next(iter(s)) to get single element in set s
+            for name, lr_vals in groups_to_lrs.items()
+            if name not in remove_names and len(lr_vals) == 1
+        }
+        return unique_lr_groups  # e.g. {'backbone': 1e-05, 'sem_seg_head': 0.0001}
+
+    def resume_or_load(self, resume=True):
+        """
+        Same as detectron2 but we update cfg.MODEL.WEIGHTS if it's missing, but found in cache dir
+        """
+        weights_path = self.cfg.MODEL.WEIGHTS
+        if "://" not in self.cfg.MODEL.WEIGHTS:  # Local filepath, try to find in torch cache dir
+            weights_path = Path(weights_path)
+            if not weights_path.exists():
+                cache_dir = torch.hub.get_dir()
+                matching_files = [
+                    filepath
+                    for filepath in Path(cache_dir).rglob(f"*{weights_path.suffix}")
+                    if filepath.name == weights_path.name
+                ]
+                if len(matching_files) == 1:
+                    logger.info(
+                        f"Weights file {weights_path} not found. Found one matching filename in"
+                        f" torchhub cache dir: {matching_files[0]}. Using matching filepath."
+                    )
+                    weights_path = str(matching_files[0])
+                elif not resume:
+                    raise RuntimeError(
+                        f"Failed to find weights file {weights_path}. Tried to use torchhub cache dir,"
+                        f" found {len(matching_files)} in cache dir (must find exactly one to use"
+                        f" cache dir path)"
+                    )
+
+        # Same as detectron2.DefaultTrainer now
+        self.checkpointer.resume_or_load(weights_path, resume=resume)
+        if resume and self.checkpointer.has_checkpoint():
+            # The checkpoint stores the training iteration that just finished, thus we start
+            # at the next iteration
+            self.start_iter = self.iter + 1
+
     def build_writers(self):
         """Same as OneFormer.train_net.py but uses cfg.LOGGER.INTERVAL and cfg.WANDB.ENABLED"""
         log_interval = self.cfg.get("LOGGER", {}).get("INTERVAL", 20)
@@ -112,7 +215,7 @@ class CustomTrainerMixin:
             # It may not always print what you want to see, since it prints "common" metrics only.
             CustomCommonMetricPrinter(max_iter=self.max_iter, window_size=log_interval),
             CustomJSONWriter(json_file=json_file, window_size=log_interval),
-            CustomWandbWriter(enabled=self.cfg.WANDB.ENABLED),
+            CustomWandbWriter(),  # Setup in self._train (don't want to setup for eval only)
         ]
 
     def build_hooks(self):
@@ -123,9 +226,11 @@ class CustomTrainerMixin:
         log_interval = get_config_value(cfg=self.cfg, key="LOGGER.INTERVAL")
         checkpoint_max_keep = get_config_value(cfg=self.cfg, key="SOLVER.CHECKPOINT_MAX_KEEP")
 
-        for hook in hooks:
+        for idx in range(len(hooks)):
+            hook = hooks[idx]
             if isinstance(hook, PeriodicWriter) and log_interval is not None:
                 hook._period = log_interval
+
             elif isinstance(hook, PeriodicCheckpointer) and checkpoint_max_keep is not None:
                 if not float(checkpoint_max_keep).is_integer() and int(checkpoint_max_keep) >= 1:
                     raise RuntimeError(
@@ -133,6 +238,10 @@ class CustomTrainerMixin:
                         f" found SOLVER.CHECKPOINT_MAX_KEEP={checkpoint_max_keep}"
                     )
                 hook.max_to_keep = checkpoint_max_keep
+
+            elif isinstance(hook, LRScheduler):
+                hooks[idx] = CustomLRScheduler(optimizer=hook._optimizer, scheduler=hook._scheduler)
+
         return hooks
 
     @classmethod
@@ -168,7 +277,16 @@ class CustomTrainerMixin:
     @classmethod
     def build_test_loader(cls, cfg, dataset_name):
         """Use our own build_detection_test_loader to support RandomSubsetInferenceSampler"""
-        return build_detection_test_loader(cfg, dataset_name)
+        data_loader = build_detection_test_loader(cfg, dataset_name)
+        pytorch_data_loader, _steps_per_epoch, _batch_size = parse_dataloader(data_loader)
+        cls._dataloaders["test"] = pytorch_data_loader
+        return data_loader  # Original dataloader, not inner pytorch dataloader
+
+    @classmethod
+    def test(cls, cfg, model, evaluators=None):
+        results = super().test(cfg=cfg, model=model, evaluators=evaluators)
+        cls._dataloaders.pop("test")
+        return results
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):
@@ -195,8 +313,10 @@ class CustomTrainerMixin:
         return evaluators
 
     def train(self):
-        """Same as DefaultTrainer.train() but calls our _train() instead of super().train()"""
+        """Same as DefaultTrainer.train() but calls our _train() instead of super().train().
+        Also handles SIGTERM to close Wandb and mark run as preempting (b/c we cancelled it)"""
         self._train()
+
         if len(self.cfg.TEST.EXPECTED_RESULTS) and comm.is_main_process():
             assert hasattr(
                 self, "_last_eval_results"
@@ -205,7 +325,54 @@ class CustomTrainerMixin:
             return self._last_eval_results
 
     def _train(self):
-        """Same as TrainerBase.train() but supports self._early_exit_iter"""
+        """Same as TrainerBase.train() but uses a sigterm handler to close wandb correctly, and
+        supports self._early_exit_iter"""
+
+        orig_signal_handlers: dict[int, Callable] = {}
+
+        def _sigterm_handler(signal_num, _frame):
+            signal_descr: Optional[str] = signal.strsignal(signal_num)
+
+            # Need exit_code=1 when using preempting=True to show 'preempted'
+            exit_code = 1
+            preempting = True
+
+            # If print statement was interrupted by SIGTERM, can't print to console during handling
+            # Use "signal_safe" logger, from CustomRunner.build_logger(), only prints to file
+            # See https://stackoverflow.com/questions/45680378/how-to-explain-the-reentrant-runtimeerror-caused-by-printing-in-signal-handlers
+            # and https://stackoverflow.com/questions/64147017/logging-signals-in-python
+            logger = logging.getLogger("signal_safe")  # Hard-coded in CustomRunner.build_logger()
+            logger.info(
+                f"Caught signal {signal_descr} ({signal_num}) during training."
+                f" Closing wandb backend with exit_code={exit_code}, preempting={preempting}."
+            )
+
+            # Use quiet=True for same reasons as signal_save loggger
+            # Wandb still not completely silent but the minimal console output doesn't cause issues
+            CustomWandbWriter.close_wandb(
+                exit_code=exit_code,
+                preempting=preempting,
+                quiet=True,
+                dataloaders=list(CustomTrainerMixin._dataloaders.values()),
+            )
+
+            logger.info("Signal handling finished. Re-raising signal with default signal handler")
+            signal.signal(signal_num, orig_signal_handlers[signal_num])
+            signal.raise_signal(signal_num)
+
+        if comm.is_main_process():
+            orig_signal_handlers[signal.SIGCONT] = signal.signal(signal.SIGCONT, _sigterm_handler)
+            orig_signal_handlers[signal.SIGTERM] = signal.signal(signal.SIGTERM, _sigterm_handler)
+
+            def _register_prev_handlers():
+                signal.signal(signal.SIGCONT, orig_signal_handlers[signal.SIGCONT])
+                signal.signal(signal.SIGTERM, orig_signal_handlers[signal.SIGTERM])
+
+            # Child processes such as those in pq_compute_multi_core will all call this handler
+            #   but only want this current process to do the cleanup; need to re-register handlers
+            # From https://stackoverflow.com/a/74688726/12422298
+            os.register_at_fork(after_in_child=lambda: _register_prev_handlers())
+
         start_iter = self.start_iter
         max_iter = self.max_iter
         self.iter = start_iter
@@ -234,25 +401,38 @@ class CustomTrainerMixin:
                 # tell whether the training successfully finished or failed
                 # due to exceptions.
                 self.iter += 1
-            except Exception:
-                logger.exception("Exception during training:")
+            except Exception as e:
+                # Sleep for a few seconds and see if we get SIGTERM, if we do the exception came
+                #   from a timeout, which triggered a dataloader crash or something
+                time.sleep(5)
+
+                # If we reach this point, it was a real exception, close with exit_code=1
+                msg = f": {str(e)}" if len(str(e)) > 0 else ""
+                logger.info(
+                    f"Caught {type(e).__name__}{msg}. Closing wandb (exit_code=1) and re-raising."
+                )
+                CustomWandbWriter.close_wandb(exit_code=1)
                 raise
             finally:
-                self.after_train()
+                self.after_train()  # Calls CustomWandbWriter.close() to close wandb
+                comm.synchronize()  # If non-main process leaves early, torchrun may terminate main
 
 
 def setup_loggers(cfg: CfgNode) -> None:
-    # Update: Setup additional logger for detectron2_plugin and this script
+    # Update: Setup additional logger for detectron2_plugin and this script, and a 'signal_safe'
+    #   version which can be safely called during SIGTERM handling (can't print to stdout)
     for name, abbrev in [
         ("mask2former", "mask2former"),  # Originally only this
         ("detectron2_plugin", "d2_plugin"),
         ("__main__", "train_net_custom"),
+        ("signal_safe", "signal_safe"),
     ]:
         plugin_logger = setup_logger(
             output=cfg.OUTPUT_DIR,
             distributed_rank=comm.get_rank(),
             name=name,
             abbrev_name=abbrev,
+            configure_stdout=True if name != "signal_safe" else False,
         )
         plugin_logger.setLevel(logging.INFO)
         for handler in plugin_logger.handlers:
@@ -261,18 +441,45 @@ def setup_loggers(cfg: CfgNode) -> None:
 
 def maybe_restart_run(args: Namespace, cfg: CfgNode):
     if cfg.get("RESTART_RUN", False):
+        args.resume = False  # Don't resume
         if comm.is_main_process():
-            args.resume = False  # Don't resume
-            remove_dir_names = ["inference", "wandb"]
-            remove_file_suffixes = [".txt", ".json"]
-            for filepath in Path(cfg.OUTPUT_DIR).glob("*"):  # Cleanup dir
-                try:
-                    if filepath.is_dir() and filepath.name in remove_dir_names:
-                        shutil.rmtree(filepath, ignore_errors=True)
-                    elif filepath.is_file() and filepath.suffix in remove_file_suffixes:
-                        filepath.unlink()
-                except Exception:
-                    # Ignore any I/O errors when removing, it's okay if we can't cleanup
-                    pass
+            # Don't backup `wandb` dir, wandb already initialized with resume=False
+            backup_dir_names_regex = ["inference"]
+            backup_file_names_regex = [
+                r"log\..+",
+                r".+\.json",
+                r".+\.pth",
+                "last_checkpoint",
+            ]  # Top-level dir only
+
+            logger.info(
+                f"Found cfg.RESTART_RUN=True, backing up directories matching"
+                f" {backup_dir_names_regex} and files matching {backup_file_names_regex}"
+            )
+
+            backup_dest_dir = Path(cfg.OUTPUT_DIR, "prev_run")
+            if backup_dest_dir.exists():
+                logger.info(
+                    f"Found previous backup dir {backup_dest_dir}. Deleting previous backup."
+                )
+                shutil.rmtree(backup_dest_dir, ignore_errors=True)  # ignore_errors req if not empty
+            backup_dest_dir.mkdir(parents=True, exist_ok=True)
+
+            for filepath in Path(cfg.OUTPUT_DIR).glob("*"):  # Not recursive
+                match_dir = any(
+                    [
+                        re.search(pattern=regex, string=filepath.name) is not None
+                        for regex in backup_dir_names_regex
+                    ]
+                )
+                match_file = any(
+                    [
+                        re.search(pattern=regex, string=filepath.name) is not None
+                        for regex in backup_file_names_regex
+                    ]
+                )
+                if (filepath.is_dir() and match_dir) or (filepath.is_file() and match_file):
+                    dest_filepath = backup_dest_dir.joinpath(filepath.name)
+                    shutil.move(src=str(filepath), dst=str(dest_filepath))
 
         comm.synchronize()
