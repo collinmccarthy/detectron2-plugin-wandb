@@ -11,11 +11,14 @@ from typing import Callable, Dict, Optional, Set
 
 import torch
 from torch.utils.data import DataLoader
+from fvcore.nn.precise_bn import get_bn_modules
 import detectron2.utils.comm as comm
 from detectron2.engine.defaults import create_ddp_model, DefaultTrainer, TrainerBase
+from detectron2.engine.defaults import hooks as d2_hooks
 from detectron2.engine.hooks import PeriodicWriter, PeriodicCheckpointer, LRScheduler
 from detectron2.checkpoint import DetectionCheckpointer
-from detectron2.evaluation import DatasetEvaluators, COCOPanopticEvaluator, verify_results
+from detectron2.evaluation import DatasetEvaluators, verify_results
+from detectron2.evaluation import COCOPanopticEvaluator
 from detectron2.utils.logger import setup_logger
 from detectron2.utils.events import EventStorage
 from detectron2.config import CfgNode
@@ -42,7 +45,7 @@ from .build import (
     build_detection_test_loader,
 )
 from .panoptic_evaluation import PartialCOCOPanopticEvaluator
-from .hooks import CustomLRScheduler
+from .hooks import CustomLRScheduler, CustomBestCheckpointer
 from .wandb import CustomWandbWriter
 
 logger = logging.getLogger(__name__)
@@ -97,7 +100,6 @@ class CustomTrainerMixin:
         elif early_exit_epochs is not None:
             early_exit_iter = early_exit_epochs * steps_per_epoch
         self._early_exit_iter = early_exit_iter
-        self._steps_per_epoch = steps_per_epoch
         self._per_gpu_batch_size = batch_size
         self._total_batch_size = batch_size * comm.get_world_size()
 
@@ -212,37 +214,125 @@ class CustomTrainerMixin:
         log_interval = self.cfg.get("LOGGER", {}).get("INTERVAL", 20)
         json_file = os.path.join(self.cfg.OUTPUT_DIR, "metrics.json")
         return [
-            # It may not always print what you want to see, since it prints "common" metrics only.
-            CustomCommonMetricPrinter(max_iter=self.max_iter, window_size=log_interval),
-            CustomJSONWriter(json_file=json_file, window_size=log_interval),
-            CustomWandbWriter(),  # Setup in self._train (don't want to setup for eval only)
+            CustomCommonMetricPrinter(
+                early_exit_iter=self._early_exit_iter,
+                max_iter=self.max_iter,
+                window_size=log_interval,
+            ),
+            CustomJSONWriter(
+                steps_per_epoch=self._trainer.steps_per_epoch,  # For EventWriterMixin
+                json_file=json_file,
+                window_size=log_interval,
+            ),
+            # Initialize wandb via `setup_wandb` from self._train (only want to init for training)
+            CustomWandbWriter(
+                steps_per_epoch=self._trainer.steps_per_epoch  # For EventWriterMixin
+            ),
         ]
 
     def build_hooks(self):
+        """Same as detectron2 DefaultTrainer.build_hooks with a few additions:
+        - Update LRScheduler -> CustomLRScheduler
+        - Update PeriodicWriter -> PeriodicWriter with log interval
+        - Add BestCheckpointer after EvalHook
         """
-        Update PeriodWriter hook with log interval, and update PeriodCheckpointer with max_to_keep
-        """
-        hooks = super().build_hooks()
-        log_interval = get_config_value(cfg=self.cfg, key="LOGGER.INTERVAL")
+        log_interval = get_config_value(cfg=self.cfg, key="LOGGER.INTERVAL", default=20)
         checkpoint_max_keep = get_config_value(cfg=self.cfg, key="SOLVER.CHECKPOINT_MAX_KEEP")
+        if (
+            checkpoint_max_keep is not None
+            and not float(checkpoint_max_keep).is_integer()
+            and int(checkpoint_max_keep) >= 1
+        ):
+            raise RuntimeError(
+                f"Expected SOLVER.CHECKPOINT_MAX_KEEP to be an integer >= 1,"
+                f" found SOLVER.CHECKPOINT_MAX_KEEP={checkpoint_max_keep}"
+            )
 
-        for idx in range(len(hooks)):
-            hook = hooks[idx]
-            if isinstance(hook, PeriodicWriter) and log_interval is not None:
-                hook._period = log_interval
+        cfg = self.cfg.clone()
+        cfg.defrost()
+        cfg.DATALOADER.NUM_WORKERS = 0  # save some memory and time for PreciseBN
 
-            elif isinstance(hook, PeriodicCheckpointer) and checkpoint_max_keep is not None:
-                if not float(checkpoint_max_keep).is_integer() and int(checkpoint_max_keep) >= 1:
-                    raise RuntimeError(
-                        f"Expected SOLVER.CHECKPOINT_MAX_KEEP to be an integer >= 1,"
-                        f" found SOLVER.CHECKPOINT_MAX_KEEP={checkpoint_max_keep}"
-                    )
-                hook.max_to_keep = checkpoint_max_keep
+        ret = [
+            d2_hooks.IterationTimer(),
+            CustomLRScheduler(),  # Updated: CustomLRScheduler
+            (
+                d2_hooks.PreciseBN(
+                    # Run at the same freq as (but before) evaluation.
+                    cfg.TEST.EVAL_PERIOD,
+                    self.model,
+                    # Build a new data loader to not affect training
+                    self.build_train_loader(cfg),
+                    cfg.TEST.PRECISE_BN.NUM_ITER,
+                )
+                if cfg.TEST.PRECISE_BN.ENABLED and get_bn_modules(self.model)
+                else None
+            ),
+        ]
 
-            elif isinstance(hook, LRScheduler):
-                hooks[idx] = CustomLRScheduler(optimizer=hook._optimizer, scheduler=hook._scheduler)
+        # Do PreciseBN before checkpointer, because it updates the model and need to
+        # be saved by checkpointer.
+        # This is not always the best: if checkpointing has a different frequency,
+        # some checkpoints may have more precise statistics than others.
+        if comm.is_main_process():  # Updated: Add checkpoint_max_keep
+            ret.append(
+                d2_hooks.PeriodicCheckpointer(
+                    checkpointer=self.checkpointer,
+                    period=cfg.SOLVER.CHECKPOINT_PERIOD,
+                    max_to_keep=checkpoint_max_keep,
+                )
+            )
 
-        return hooks
+        def test_and_save_results():
+            self._last_eval_results = self.test(self.cfg, self.model)
+            return self._last_eval_results
+
+        # Do evaluation after checkpointer, because then if it fails,
+        # we can use the saved checkpoint to debug.
+        ret.append(d2_hooks.EvalHook(cfg.TEST.EVAL_PERIOD, test_and_save_results))
+
+        # Updated: Add BestCheckpointer
+        best_metrics = cfg.SOLVER.CHECKPOINT_BEST_METRICS
+        wandb_save = cfg.SOLVER.CHECKPOINT_BEST_METRICS_WANDB_SAVE
+        if type(best_metrics) != type(wandb_save):
+            raise RuntimeError(
+                f"Found type(cfg.SOLVER.CHECKPOINT_BEST_METRICS) = {type(best_metrics)} and"
+                f" type(cfg.SOLVER.CHECKPOINT_BEST_METRICS_WANDB_SAVE) = {type(wandb_save)}."
+                f" Types must match."
+            )
+
+        if isinstance(best_metrics, str):
+            val_metrics = [best_metrics]
+            save_wandb_flags = [wandb_save]
+        elif isinstance(best_metrics, (list, tuple)):
+            if len(wandb_save) != len(best_metrics):
+                raise RuntimeError(
+                    f"Found len(cfg.SOLVER.CHECKPOINT_BEST_METRICS) = {len(best_metrics)} and"
+                    f" len(cfg.SOLVER.CHECKPOINT_BEST_METRICS_WANDB_SAVE) = {len(wandb_save)}."
+                    f" Lenghts must be the same."
+                )
+            val_metrics = best_metrics
+            save_wandb_flags = wandb_save
+        elif best_metrics is None:
+            assert wandb_save is not None, "Types should match"
+            val_metrics = []
+            save_wandb_flags = []
+
+        for val_metric, save_wandb in zip(val_metrics, save_wandb_flags):
+            ret.append(
+                CustomBestCheckpointer(
+                    eval_period=cfg.TEST.EVAL_PERIOD,
+                    checkpointer=self.checkpointer,
+                    val_metric=val_metric,
+                    save_wandb=save_wandb,
+                )
+            )
+
+        if comm.is_main_process():
+            # Here the default print/log frequency of each writer is used.
+            # run writers in the end, so that evaluation metrics are written
+            # Update: Add log_interval
+            ret.append(d2_hooks.PeriodicWriter(self.build_writers(), period=log_interval))
+        return ret
 
     @classmethod
     def build_train_loader(cls, cfg):
@@ -296,6 +386,7 @@ class CustomTrainerMixin:
 
         # Replace COCOPanopticEvaluator with ParitalCOCOPanopticEvaluator if using test subset
         # This is required to avoid a runtime error that will prevent PQ from being calculated
+        # And we also update how the multiprocessing pool is closed for multi-core PQ results
         test_subset_ratio = get_config_value(cfg=cfg, key="DATALOADER.TEST_RANDOM_SUBSET_RATIO")
         test_subset_size = get_config_value(cfg=cfg, key="DATALOADER.TEST_RANDOM_SUBSET_SIZE")
         if test_subset_ratio is not None or test_subset_size is not None:
@@ -385,11 +476,12 @@ class CustomTrainerMixin:
 
         logger.info(
             f"Starting training with start_iter={start_iter}, max_iter={max_iter},"
-            f" steps_per_epoch={self._steps_per_epoch},"
+            f" steps_per_epoch={self._trainer.steps_per_epoch},"
             f" per_gpu_batch_size={self._per_gpu_batch_size},"
             f" total_batch_size={self._total_batch_size}"
         )
 
+        success = False
         with EventStorage(start_iter) as self.storage:
             try:
                 self.before_train()
@@ -401,6 +493,7 @@ class CustomTrainerMixin:
                 # tell whether the training successfully finished or failed
                 # due to exceptions.
                 self.iter += 1
+                success = True
             except Exception as e:
                 # Sleep for a few seconds and see if we get SIGTERM, if we do the exception came
                 #   from a timeout, which triggered a dataloader crash or something
@@ -414,8 +507,13 @@ class CustomTrainerMixin:
                 CustomWandbWriter.close_wandb(exit_code=1)
                 raise
             finally:
+                if success:
+                    logger.info(
+                        f"Succesfully finished training for {max_iter} iter. Calling after_train()."
+                    )
                 self.after_train()  # Calls CustomWandbWriter.close() to close wandb
-                comm.synchronize()  # If non-main process leaves early, torchrun may terminate main
+
+        comm.synchronize()  # If non-main process leaves early, torchrun may terminate main
 
 
 def setup_loggers(cfg: CfgNode) -> None:

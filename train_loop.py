@@ -18,6 +18,20 @@ from .distributed_sampler import (
 logger = logging.getLogger(__name__)
 
 
+def get_epoch(iter: int, steps_per_epoch: int) -> int:
+    return int(iter / steps_per_epoch)
+
+
+def get_epoch_iter(iter: int, steps_per_epoch: int) -> int:
+    return int(iter - (get_epoch(iter, steps_per_epoch) * steps_per_epoch))
+
+
+def get_epoch_float(iter: int, steps_per_epoch: int) -> int:
+    return get_epoch(iter, steps_per_epoch) + (
+        get_epoch_iter(iter, steps_per_epoch) / steps_per_epoch
+    )
+
+
 def parse_dataloader(
     data_loader: Union[AspectRatioGroupedDataset, MapDataset, DataLoader]
 ) -> Union[int, float]:
@@ -92,16 +106,21 @@ class EpochTrainerMixin:
         super().__init__(*args, **kwargs)
         self._steps_per_epoch = steps_per_epoch
 
+    @property
+    def steps_per_epoch(self) -> int:
+        return self._steps_per_epoch
+
     def epoch(self, iter: Optional[int] = None) -> int:
         iter = self.iter if iter is None else iter
-        return int(iter / self._steps_per_epoch)
+        return get_epoch(iter=iter, steps_per_epoch=self._steps_per_epoch)
 
     def epoch_iter(self, iter: Optional[int] = None) -> int:
         iter = self.iter if iter is None else iter
-        return int(iter - (self.epoch(iter) * self._steps_per_epoch))
+        return get_epoch_iter(iter=iter, steps_per_epoch=self._steps_per_epoch)
 
     def epoch_float(self, iter: Optional[int] = None) -> float:
-        return self.epoch(iter) + self.epoch_iter(iter) / self._steps_per_epoch
+        iter = self.iter if iter is None else iter
+        return get_epoch_float(iter=iter, steps_per_epoch=self._steps_per_epoch)
 
     def _write_metrics(
         self,
@@ -110,18 +129,25 @@ class EpochTrainerMixin:
         prefix: str = "",
         iter: Optional[int] = None,
     ) -> None:
-
-        iter = self.iter if iter is None else iter
-
         # Update: Add epoch and epoch_iter based on dataloader and global iter
-        epoch = self.epoch(iter)
-        epoch_iter = self.epoch_iter(iter)
-        epoch_float = self.epoch_float(iter)
+        # Log these as the "start" of the next iteration
+        #   e.g. after 1 epoch, epoch=1, epoch_iter=0, epoch_float=1.0 (e.g. after 1 epoch, epoch_float=1.0)
+        cur_iter = self.iter if iter is None else iter
+        next_iter = cur_iter + 1
+        epoch = self.epoch(next_iter)
+        epoch_iter = self.epoch_iter(next_iter)
+        epoch_float = self.epoch_float(next_iter)
 
-        if (iter + 1) % self.gather_metric_period == 0:
+        if (next_iter) % self.gather_metric_period == 0:
             try:
                 EpochTrainerMixin.write_metrics(
-                    loss_dict, data_time, iter, epoch, epoch_iter, epoch_float, prefix
+                    loss_dict=loss_dict,
+                    data_time=data_time,
+                    cur_iter=cur_iter,  # Pass in cur_iter so all logging is done w/ cur_iter
+                    epoch=epoch,
+                    epoch_iter=epoch_iter,
+                    epoch_float=epoch_float,
+                    prefix=prefix,
                 )
             except Exception:
                 logger.exception("Exception in writing metrics: ")

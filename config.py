@@ -4,7 +4,7 @@ import logging
 import socket
 import re
 from typing import Tuple
-from typing import Any
+from typing import Any, Optional
 from pathlib import Path
 from argparse import Namespace
 
@@ -15,14 +15,14 @@ import detectron2.utils.comm as comm
 logger = logging.getLogger(__name__)
 
 
-def get_config_value(cfg: CN, key: str) -> Any:
+def get_config_value(cfg: CN, key: str, default: Optional[Any] = None) -> Any:
     subkeys = key.split(".")
     subcfg = cfg
     for idx, subkey in enumerate(subkeys):
         if idx < len(subkeys) - 1:
             subcfg = subcfg.get(subkey, {})
         else:
-            subcfg = subcfg.get(subkey, None)
+            subcfg = subcfg.get(subkey, default)
 
     return subcfg
 
@@ -77,6 +77,13 @@ def _add_mmdet_config(cfg):
 
     # Only latest 2 checkpoints by default
     cfg.SOLVER.CHECKPOINT_MAX_KEEP = 2
+    cfg.SOLVER.CHECKPOINT_BEST_METRICS = ["panoptic_seg/PQ", "sem_seg/mIoU", "bbox/AP", "segm/AP"]
+    cfg.SOLVER.CHECKPOINT_BEST_METRICS_WANDB_SAVE = [
+        True,
+        False,
+        False,
+        False,
+    ]  # TODO: Update to strs like best metrics above
 
     # Allow us to pass in epochs for SOLVER.MAX_ITER, TEST.EVAL_PERIOD, SOLVER.CHECKPOINT_PERIOD
     # We'll calculate iter-based values in CustomTrainer.__init__() (train_net_custom.py)
@@ -93,7 +100,7 @@ def _add_mmdet_config(cfg):
     cfg.DATALOADER.TEST_RANDOM_SUBSET_SIZE = None
 
     # Other dataloader defaults not used in d2
-    cfg.DATALOADER.PERSISTENT_WORKERS = False  # This with pq_compute_multi_core() can slow us down
+    cfg.DATALOADER.PERSISTENT_WORKERS = True  # This with pq_compute_multi_core() can slow us down?
     cfg.DATALOADER.PIN_MEMORY = True
 
     # For restarting run in debug mode

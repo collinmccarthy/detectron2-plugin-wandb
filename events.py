@@ -3,12 +3,17 @@ import os
 import json
 import torch
 import re
+import time
+import datetime
 from typing import Dict, Any, Iterable, Union, List, Optional
 from detectron2.utils.events import (
     JSONWriter,
     CommonMetricPrinter,
     get_event_storage,
 )
+
+from .utils import get_time_str_from_sec
+from .train_loop import get_epoch, get_epoch_iter, get_epoch_float
 
 
 class BaseRule(object):
@@ -56,8 +61,14 @@ class Prefix(BaseRule):
 
 class EventWriterMixin:
     def __init__(
-        self, *args, eval_str: str = "val", wandb_skip_keys: Optional[List[str]] = None, **kwargs
+        self,
+        *args,
+        steps_per_epoch: int,
+        eval_str: str = "val",
+        wandb_skip_keys: Optional[List[str]] = None,
+        **kwargs,
     ):
+        self._steps_per_epoch = steps_per_epoch
         super().__init__(*args, **kwargs)
         self._last_write = -1
         self._group_rules = [
@@ -70,7 +81,6 @@ class EventWriterMixin:
             "rank_data_time",
             "data_time",
             "time",
-            "eta_seconds",
             "epoch_iter",
             r"min\(IoU, B-Iou\)-[a-zA-Z]+",
         ]
@@ -113,6 +123,8 @@ class EventWriterMixin:
     ) -> dict:
 
         # Update scalars to log same keys as mmdetection does
+        iter_key: Optional[str] = None
+        iter_val: Optional[int] = None
         for key in list(scalars.keys()):
             key_split = key.split("/")
             last_key = key_split[-1]
@@ -123,8 +135,16 @@ class EventWriterMixin:
                 ]
             )
 
+            # Remove skipped keys first or keys like `min(IoU, B-Iou)-` get matched below and output
             if wandb_writer and wandb_skip_key:
                 scalars.pop(key)
+
+            elif last_key == "iter":
+                # Increment by 1 (epoch/epoch_iter/epoch_float already use this incremented iter)
+                # This way it corresponds to epoch/epoch_iter/epoch_float
+                scalars[key] = scalars[key] + 1
+                iter_key = key
+                iter_val = scalars[key]
 
             elif last_key == "total_loss":
                 new_last_key = "loss"
@@ -176,6 +196,34 @@ class EventWriterMixin:
                     new_key = "/".join(key_split[:-1] + [last_key]).replace("sem_seg/", "coco/")
                     scalars[new_key] = scalars.pop(key)
 
+            elif last_key in ["early_eta_seconds", "eta_seconds"]:  # Early uses 'early_exit_iter'
+                prefix = "early_" if key.startswith("early_") else ""
+                eta_seconds = scalars.pop(key)
+                eta_hrs_key = "/".join(key_split[:-1] + [f"{prefix}total_eta_hrs"])
+                scalars[eta_hrs_key] = eta_seconds / (60 * 60)
+                eta_str_key = "/".join(key_split[:-1] + [f"{prefix}total_eta"])
+                scalars[eta_str_key] = get_time_str_from_sec(eta_seconds)
+
+        if iter_key is None:
+            raise RuntimeError(f"Expected 'iter' key in every logged metric")
+
+        # Add epoch/epoch_iter/epoch_float if they don't exist (they won't for validation)
+        epoch_key = iter_key.replace("iter", "epoch")
+        if epoch_key not in scalars:
+            scalars[epoch_key] = get_epoch(iter=iter_val, steps_per_epoch=self._steps_per_epoch)
+
+        epoch_iter_key = iter_key.replace("iter", "epoch_iter")
+        if epoch_iter_key not in scalars:
+            scalars[epoch_iter_key] = get_epoch_iter(
+                iter=iter_val, steps_per_epoch=self._steps_per_epoch
+            )
+
+        epoch_float_key = iter_key.replace("iter", "epoch_float")
+        if epoch_float_key not in scalars:
+            scalars[epoch_float_key] = get_epoch_float(
+                iter=iter_val, steps_per_epoch=self._steps_per_epoch
+            )
+
         return scalars
 
 
@@ -198,6 +246,36 @@ class CustomJSONWriter(EventWriterMixin, JSONWriter):
 
 
 class CustomCommonMetricPrinter(CommonMetricPrinter):
+    def __init__(self, *args, early_exit_iter: int, **kwargs):
+        self._early_exit_iter = early_exit_iter
+        super().__init__(*args, **kwargs)
+
+    def _get_eta(self, storage) -> Optional[str]:
+        """Add our 'early_eta_seconds' metric"""
+        if self._max_iter is None:
+            return ""
+        iteration = storage.iter
+        try:
+            eta_seconds = storage.history("time").median(1000) * (self._max_iter - iteration - 1)
+            storage.put_scalar("eta_seconds", eta_seconds, smoothing_hint=False)
+
+            # Added
+            early_eta_seconds = eta_seconds * (self._early_exit_iter / self._max_iter)
+            storage.put_scalar("early_eta_seconds", early_eta_seconds, smoothing_hint=False)
+
+            return str(datetime.timedelta(seconds=int(eta_seconds)))
+        except KeyError:
+            # estimate eta on our own - more noisy
+            eta_string = None
+            if self._last_write is not None:
+                estimate_iter_time = (time.perf_counter() - self._last_write[1]) / (
+                    iteration - self._last_write[0]
+                )
+                eta_seconds = estimate_iter_time * (self._max_iter - iteration - 1)
+                eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
+            self._last_write = (iteration, time.perf_counter())
+            return eta_string
+
     def write(self):
         storage = get_event_storage()
         iteration = storage.iter

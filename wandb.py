@@ -29,6 +29,7 @@ class CustomWandbWriter(EventWriterMixin, EventWriter):
 
     _initialized = False
     _closed = True
+    _output_dir: Optional[Path] = None
 
     def write(self):
         if CustomWandbWriter._closed or not CustomWandbWriter._initialized:
@@ -70,6 +71,7 @@ class CustomWandbWriter(EventWriterMixin, EventWriter):
             wandb.log(scalars, commit=True)
 
     def close(self):
+        std_logger.info(f"Closing wandb normally.")
         self.close_wandb()
 
     @classmethod
@@ -88,6 +90,7 @@ class CustomWandbWriter(EventWriterMixin, EventWriter):
             if output_dir is None:
                 raise RuntimeError(f"Missing wandb output dir. Set WANDB.DIR in config")
             Path(output_dir).mkdir(parents=True, exist_ok=True)
+            cls._output_dir = output_dir
 
             # only include most related part to avoid too big table
             # TODO: add configurable params to select which part of `cfg` should be saved in config
@@ -123,7 +126,7 @@ class CustomWandbWriter(EventWriterMixin, EventWriter):
                 renamed_config = config.with_name("config.yml")
                 renamed_config.unlink(missing_ok=True)
                 config.rename(renamed_config)
-                wandb.save(str(config), base_path=str(config.parent), policy="now")
+                wandb.save(str(renamed_config), base_path=str(config.parent), policy="now")
 
         comm.synchronize()
 
@@ -148,8 +151,10 @@ class CustomWandbWriter(EventWriterMixin, EventWriter):
                 return
 
             # Allow up to 10 minutes for checkpoints to upload
-            # This should be plenty, and will prevent any hangs from huge checkpoint files
-            timeout_min = 5
+            # Unless we accidentally upload several checkpoints, this should take a few min max
+            # It's possible this hangs for very large checkpoints or bad connections, in which case
+            #   we just want to exit and we can try to sync after via wandb cli
+            timeout_min = 10
 
             logger.info(
                 f"Wandb backend is not closed. Calling wandb.finish(exit_code={exit_code})"
@@ -200,7 +205,23 @@ class CustomWandbWriter(EventWriterMixin, EventWriter):
                     logger.info(f"Resume file still exists, removing backup resume file")
                     os.remove(resume_file_backup)
 
-        comm.synchronize()
+        # Don't synchronize, some processes may never get here
+
+    @classmethod
+    def save_checkpoint(cls, checkpoint_path: str):
+        if not cls._initialized:
+            return
+        if cls._closed:
+            raise RuntimeError(
+                f"Cannot save best checkpoint: {checkpoint_path}. Wandb is already closed."
+            )
+
+        if not checkpoint_path.exists():
+            raise RuntimeError(
+                f"Best checkpoint path {checkpoint_path} does not exist. Cannot save to wandb."
+            )
+
+        wandb.save(str(checkpoint_path), base_path=str(checkpoint_path.parent), policy="now")
 
 
 def _backup_resume_file(resume_file: Path, quiet: bool = False) -> Path:
