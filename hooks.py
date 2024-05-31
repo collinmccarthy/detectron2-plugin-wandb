@@ -1,8 +1,11 @@
+import time
+import datetime
 import pprint
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from pathlib import Path
-from detectron2.engine.hooks import LRScheduler, BestCheckpointer
+from detectron2.engine.hooks import LRScheduler, BestCheckpointer, HookBase, EvalHook
 import detectron2.utils.comm as comm
+from detectron2.utils.events import get_event_storage, EventStorage
 
 from .wandb import CustomWandbWriter
 
@@ -79,3 +82,91 @@ class CustomBestCheckpointer(BestCheckpointer):
         if saved and self._save_wandb:
             checkpoint_path = Path(self._checkpointer.save_dir, f"{checkpoint_stem}.pth")
             CustomWandbWriter.save_checkpoint(checkpoint_path)
+
+
+class ETAHook(HookBase):
+    def __init__(self, max_iter: int, early_exit_iter: Optional[int] = None):
+        self._max_iter = max_iter
+        self._early_exit_iter = early_exit_iter
+        self._last_write = None  # (step, time) of last call to write(). Used to compute ETA
+
+    def _log_eta(self) -> Optional[str]:
+        # From detectron2.CommonMetricPrinter, but adds our 'early_eta_seconds' metric
+        storage = get_event_storage()
+        iteration = storage.iter
+
+        eta_seconds: Optional[int]
+        try:
+            eta_seconds = storage.history("time").median(1000) * (self._max_iter - iteration - 1)
+
+        except KeyError:
+            # estimate eta on our own - more noisy
+            eta_seconds = None
+            if self._last_write is not None:
+                estimate_iter_time = (time.perf_counter() - self._last_write[1]) / (
+                    iteration - self._last_write[0]
+                )
+                eta_seconds = estimate_iter_time * (self._max_iter - iteration - 1)
+            self._last_write = (iteration, time.perf_counter())
+
+        if eta_seconds is not None:
+            storage.put_scalar("eta_seconds", eta_seconds, smoothing_hint=False)
+
+            early_exit_iter = (
+                self._early_exit_iter if self._early_exit_iter is not None else self._max_iter
+            )
+            early_eta_seconds = eta_seconds * (early_exit_iter / self._max_iter)
+            storage.put_scalar("early_eta_seconds", early_eta_seconds, smoothing_hint=False)
+
+    def after_step(self):
+        self._log_eta()  # Only log after step, not after train
+
+
+class EpochIterHook(HookBase):
+    def _log(self, log_iter: int):
+        storage = get_event_storage()
+        epoch = self.trainer._trainer.epoch(log_iter)
+        epoch_iter = self.trainer._trainer.epoch_iter(log_iter)
+        epoch_float = self.trainer._trainer.epoch_float(log_iter)
+        storage.put_scalars(
+            cur_iter=storage.iter,
+            iter=log_iter,
+            epoch=epoch,
+            epoch_iter=epoch_iter,
+            epoch_float=epoch_float,
+        )
+
+    def after_step(self):
+        # Here trainer.iter not yet incremented by 1 (e.g. after 10 iter, trainer.iter=9)
+        # Want to log iter as _next_ iter (e.g. after 10 iter, iter=10)
+        # Then log epoch/epoch_iter/epoch_float to match this (e.g. after 10 iter, epoch_iter=10)
+        self._log(log_iter=self.trainer.iter + 1)
+
+    def after_train(self):
+        # Here trainer.iter is already incremented by 1 (e.g. after 100k iter, trainer.iter=100k)
+        # Want to log iter as current iter in the same way
+        self._log(log_iter=self.trainer.iter)
+
+
+class CustomEvalHook(EvalHook):
+    def __init__(self, *args, eval_iters: Optional[List[int]] = None, **kwargs):
+        if eval_iters is None:
+            eval_iters = [-1]
+        else:
+            if not isinstance(eval_iters, (list, tuple)):
+                eval_iters = [eval_iters]
+
+        if not all([isinstance(i, int) for i in eval_iters]):
+            raise RuntimeError(
+                f"Expected eval_iters to be all integers, found eval_iters={eval_iters}"
+            )
+
+        self._iters = eval_iters
+        super().__init__(*args, **kwargs)
+
+    def after_step(self):
+        next_iter = self.trainer.iter + 1
+        if self._period > 0 and (next_iter % self._period == 0 or next_iter in self._iters):
+            # do the last eval in after_train
+            if next_iter != self.trainer.max_iter:
+                self._do_eval()

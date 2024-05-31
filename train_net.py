@@ -5,9 +5,10 @@ import logging
 import shutil
 import time
 import signal
+import subprocess
 from pathlib import Path
 from argparse import Namespace
-from typing import Callable, Dict, Optional, Set
+from typing import Callable, Dict, Optional, Set, List
 
 import torch
 from torch.utils.data import DataLoader
@@ -15,9 +16,8 @@ from fvcore.nn.precise_bn import get_bn_modules
 import detectron2.utils.comm as comm
 from detectron2.engine.defaults import create_ddp_model, DefaultTrainer, TrainerBase
 from detectron2.engine.defaults import hooks as d2_hooks
-from detectron2.engine.hooks import PeriodicWriter, PeriodicCheckpointer, LRScheduler
 from detectron2.checkpoint import DetectionCheckpointer
-from detectron2.evaluation import DatasetEvaluators, verify_results
+from detectron2.evaluation import DatasetEvaluators, DatasetEvaluator, verify_results
 from detectron2.evaluation import COCOPanopticEvaluator
 from detectron2.utils.logger import setup_logger
 from detectron2.utils.events import EventStorage
@@ -45,7 +45,7 @@ from .build import (
     build_detection_test_loader,
 )
 from .panoptic_evaluation import PartialCOCOPanopticEvaluator
-from .hooks import CustomLRScheduler, CustomBestCheckpointer
+from .hooks import CustomLRScheduler, CustomBestCheckpointer, ETAHook, CustomEvalHook, EpochIterHook
 from .wandb import CustomWandbWriter
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,7 @@ logger = logging.getLogger(__name__)
 
 class CustomTrainerMixin:
     _dataloaders: Dict[str, DataLoader] = {}
+    _test_eval_fp16: bool = False
 
     def __init__(self, cfg):
         """Same as train_net.py but uses CustomAMPTrainer instead of AMPTrainer and
@@ -90,16 +91,40 @@ class CustomTrainerMixin:
             optimizer=optimizer,
         )
 
+        # Update: Define test precision if set
+        test_eval_fp16: Optional[bool] = get_config_value(cfg=cfg, key="TEST.EVAL_FP16")
+        if test_eval_fp16:
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA is required if TEST.EVAL_FP16=True")
+            CustomTrainerMixin._test_eval_fp16 = True
+
         # Update: Add early_exit_iter and other metrics we print out in self._train()
-        early_exit_iter = get_config_value(cfg=cfg, key="SOLVER.EARLY_EXIT_ITER")
-        early_exit_epochs = get_config_value(cfg=cfg, key="SOLVER.EARLY_EXIT_EPOCHS")
+        early_exit_iter: Optional[int] = get_config_value(cfg=cfg, key="SOLVER.EARLY_EXIT_ITER")
+        early_exit_epochs: Optional[int] = get_config_value(cfg=cfg, key="SOLVER.EARLY_EXIT_EPOCHS")
+        slurm_requeue_num_epochs: Optional[int] = get_config_value(
+            cfg=cfg, key="SOLVER.SLURM_REQUEUE_NUM_EPOCHS"
+        )
+        slurm_job_id: Optional[str] = None
         if early_exit_iter is not None and early_exit_epochs is not None:
             raise RuntimeError(
-                f"Found both SOLVER.EARLY_EXIT_ITER and SOLVER.EARLY_EXIT_EPOCHS. Expected only one."
+                f"Found both SOLVER.EARLY_EXIT_ITER={early_exit_iter} and"
+                f" SOLVER.EARLY_EXIT_EPOCHS={early_exit_epochs}. Expected only one to be set."
             )
         elif early_exit_epochs is not None:
             early_exit_iter = early_exit_epochs * steps_per_epoch
+
+        slurm_requeue_num_iter: Optional[int] = None
+        if slurm_requeue_num_epochs is not None:
+            slurm_requeue_num_iter = slurm_requeue_num_epochs * steps_per_epoch
+            slurm_job_id = os.environ.get("SLURM_JOB_ID")
+            if slurm_job_id is None:
+                raise RuntimeError(
+                    f"Expected SLURM_JOB_ID in environment if using SOLVER.SLURM_REQUEUE_NUM_EPOCHS"
+                )
+
         self._early_exit_iter = early_exit_iter
+        self._slurm_requeue_num_iter = slurm_requeue_num_iter
+        self._slurm_job_id = slurm_job_id
         self._per_gpu_batch_size = batch_size
         self._total_batch_size = batch_size * comm.get_world_size()
 
@@ -288,49 +313,46 @@ class CustomTrainerMixin:
 
         # Do evaluation after checkpointer, because then if it fails,
         # we can use the saved checkpoint to debug.
-        ret.append(d2_hooks.EvalHook(cfg.TEST.EVAL_PERIOD, test_and_save_results))
+        ret.append(
+            CustomEvalHook(
+                eval_iters=cfg.TEST.EVAL_EXPLICIT_ITERS,
+                eval_period=cfg.TEST.EVAL_PERIOD,
+                eval_function=test_and_save_results,
+                eval_after_train=True,
+            )
+        )
 
         # Updated: Add BestCheckpointer
-        best_metrics = cfg.SOLVER.CHECKPOINT_BEST_METRICS
-        wandb_save = cfg.SOLVER.CHECKPOINT_BEST_METRICS_WANDB_SAVE
-        if type(best_metrics) != type(wandb_save):
+        best_metrics = cfg.SOLVER.get("CHECKPOINT_BEST_METRICS", [])
+        if isinstance(best_metrics, str):
+            best_metrics = [best_metrics]
+
+        wandb_save = cfg.SOLVER.get("CHECKPOINT_BEST_METRICS_WANDB_SAVE", [])
+        if isinstance(wandb_save, str):
+            wandb_save = [wandb_save]
+
+        if any([metric not in best_metrics for metric in wandb_save]):
             raise RuntimeError(
-                f"Found type(cfg.SOLVER.CHECKPOINT_BEST_METRICS) = {type(best_metrics)} and"
-                f" type(cfg.SOLVER.CHECKPOINT_BEST_METRICS_WANDB_SAVE) = {type(wandb_save)}."
-                f" Types must match."
+                f"Expected all metrics in SOLVER.CHECKPOINT_BEST_METRICS_WANDB_SAVE to be in"
+                f" SOLVER.CHECKPOINT_BEST_METRICS"
             )
 
-        if isinstance(best_metrics, str):
-            val_metrics = [best_metrics]
-            save_wandb_flags = [wandb_save]
-        elif isinstance(best_metrics, (list, tuple)):
-            if len(wandb_save) != len(best_metrics):
-                raise RuntimeError(
-                    f"Found len(cfg.SOLVER.CHECKPOINT_BEST_METRICS) = {len(best_metrics)} and"
-                    f" len(cfg.SOLVER.CHECKPOINT_BEST_METRICS_WANDB_SAVE) = {len(wandb_save)}."
-                    f" Lenghts must be the same."
-                )
-            val_metrics = best_metrics
-            save_wandb_flags = wandb_save
-        elif best_metrics is None:
-            assert wandb_save is not None, "Types should match"
-            val_metrics = []
-            save_wandb_flags = []
-
-        for val_metric, save_wandb in zip(val_metrics, save_wandb_flags):
+        for val_metric in best_metrics:
             ret.append(
                 CustomBestCheckpointer(
                     eval_period=cfg.TEST.EVAL_PERIOD,
                     checkpointer=self.checkpointer,
                     val_metric=val_metric,
-                    save_wandb=save_wandb,
+                    save_wandb=val_metric in wandb_save,
                 )
             )
 
         if comm.is_main_process():
             # Here the default print/log frequency of each writer is used.
             # run writers in the end, so that evaluation metrics are written
-            # Update: Add log_interval
+            # Update: Add separate ETA hook, pass in log_interval
+            ret.append(ETAHook(max_iter=self.max_iter, early_exit_iter=self._early_exit_iter))
+            ret.append(EpochIterHook())
             ret.append(d2_hooks.PeriodicWriter(self.build_writers(), period=log_interval))
         return ret
 
@@ -374,8 +396,21 @@ class CustomTrainerMixin:
 
     @classmethod
     def test(cls, cfg, model, evaluators=None):
-        results = super().test(cfg=cfg, model=model, evaluators=evaluators)
+        # if torch.cuda.is_available():
+        #     torch.cuda.empty_cache()  # Empty from last train iter, to avoid OOM
+
+        if cls._test_eval_fp16:
+            from torch.cuda.amp import autocast
+
+            with autocast(dtype=torch.float16):
+                results = super().test(cfg=cfg, model=model, evaluators=evaluators)
+        else:
+            results = super().test(cfg=cfg, model=model, evaluators=evaluators)
+
         cls._dataloaders.pop("test")
+
+        # if torch.cuda.is_available():
+        #     torch.cuda.empty_cache()  # Empty from test, again to avoid OOM
         return results
 
     @classmethod
@@ -389,17 +424,38 @@ class CustomTrainerMixin:
         # And we also update how the multiprocessing pool is closed for multi-core PQ results
         test_subset_ratio = get_config_value(cfg=cfg, key="DATALOADER.TEST_RANDOM_SUBSET_RATIO")
         test_subset_size = get_config_value(cfg=cfg, key="DATALOADER.TEST_RANDOM_SUBSET_SIZE")
+
         if test_subset_ratio is not None or test_subset_size is not None:
+            final_evaluators: List[DatasetEvaluator] = []
             if isinstance(evaluators, DatasetEvaluators):  # Multiple evaluators
-                for idx, evaluator in enumerate(evaluators._evaluators):
+                for evaluator in evaluators._evaluators:
                     if type(evaluator) == COCOPanopticEvaluator:
-                        evaluators._evaluators[idx] = PartialCOCOPanopticEvaluator(
-                            dataset_name=dataset_name, output_dir=evaluator._output_dir
+                        final_evaluators.append(
+                            PartialCOCOPanopticEvaluator(
+                                dataset_name=dataset_name, output_dir=evaluator._output_dir
+                            )
                         )
+                    else:
+                        logger.info(
+                            f"Dropping unsupported evaluator {type(evaluator).__name__} when"
+                            f" testing on a subset with DATALOADER.TEST_RANDOM_SUBSET_SIZE or"
+                            f" DATALOADER.TEST_RANDOM_SUBSET_RATIO."
+                        )
+
             elif type(evaluators) == COCOPanopticEvaluator:  # Single evaluator
-                evaluators = PartialCOCOPanopticEvaluator(
-                    dataset_name=dataset_name, output_dir=evaluator._output_dir
+                final_evaluators.append(
+                    PartialCOCOPanopticEvaluator(
+                        dataset_name=dataset_name, output_dir=evaluator._output_dir
+                    )
                 )
+
+            else:
+                raise RuntimeError(
+                    f"Only COCOPanopticEvaluator is supported with"
+                    f" DATALOADER.TEST_RANDOM_SUBSET_RATIO or DATALOADER.TEST_RANDOM_SUBSET_SIZE"
+                )
+
+            evaluators = DatasetEvaluators(final_evaluators)
 
         return evaluators
 
@@ -471,8 +527,18 @@ class CustomTrainerMixin:
 
         # Use early_exit_iter only for range in loop below, not for self.max_iter
         # We only want to break out early, don't want to impact any other mechanisms
-        if self._early_exit_iter is not None:
-            max_iter = min(max_iter, self._early_exit_iter)
+        slurm_requeue_on_finish = False
+        early_exit = False
+        if self._early_exit_iter is not None and self._early_exit_iter < max_iter:
+            max_iter = self._early_exit_iter
+            early_exit = True
+
+        if self._slurm_requeue_num_iter is not None:
+            slurm_max_iter = start_iter + self._slurm_requeue_num_iter
+            if slurm_max_iter < max_iter:
+                max_iter = slurm_max_iter
+                slurm_requeue_on_finish = True
+                early_exit = True
 
         logger.info(
             f"Starting training with start_iter={start_iter}, max_iter={max_iter},"
@@ -511,9 +577,18 @@ class CustomTrainerMixin:
                     logger.info(
                         f"Succesfully finished training for {max_iter} iter. Calling after_train()."
                     )
-                self.after_train()  # Calls CustomWandbWriter.close() to close wandb
+                # Only mark as preempting if requeuing
+                CustomWandbWriter.close_wandb(exit_code=0, preempting=early_exit)
+                self.after_train()
 
-        comm.synchronize()  # If non-main process leaves early, torchrun may terminate main
+        # comm.synchronize()  # If non-main process leaves early, torchrun may terminate main?
+        if slurm_requeue_on_finish and comm.is_main_process():
+            assert self._slurm_job_id is not None, "Expected SLURM_JOB_ID if requeueing"
+            logger.info(
+                f"Requeuing slurm_job_id={self._slurm_job_id} after"
+                f" {self._slurm_requeue_num_iter} iterations"
+            )
+            subprocess.run(f"scontrol requeue {self._slurm_job_id}", shell=True)
 
 
 def setup_loggers(cfg: CfgNode) -> None:

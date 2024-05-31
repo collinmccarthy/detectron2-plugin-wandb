@@ -192,6 +192,10 @@ class EventWriterMixin:
                 if wandb_writer and per_class:
                     scalars.pop(key)  # Drop per-class IoU, e.g. 'sem_seg/mIoU-person'
                 else:
+                    # Cityscapes uses IoU not mIoU, log as mIoU
+                    if last_key == "IoU":
+                        last_key = "mIoU"
+
                     # e.g. 'sem_seg/mIoU' -> 'coco/mIoU'
                     new_key = "/".join(key_split[:-1] + [last_key]).replace("sem_seg/", "coco/")
                     scalars[new_key] = scalars.pop(key)
@@ -250,36 +254,10 @@ class CustomCommonMetricPrinter(CommonMetricPrinter):
         self._early_exit_iter = early_exit_iter
         super().__init__(*args, **kwargs)
 
-    def _get_eta(self, storage) -> Optional[str]:
-        """Add our 'early_eta_seconds' metric"""
-        if self._max_iter is None:
-            return ""
-        iteration = storage.iter
-        try:
-            eta_seconds = storage.history("time").median(1000) * (self._max_iter - iteration - 1)
-            storage.put_scalar("eta_seconds", eta_seconds, smoothing_hint=False)
-
-            # Added
-            early_eta_seconds = eta_seconds * (self._early_exit_iter / self._max_iter)
-            storage.put_scalar("early_eta_seconds", early_eta_seconds, smoothing_hint=False)
-
-            return str(datetime.timedelta(seconds=int(eta_seconds)))
-        except KeyError:
-            # estimate eta on our own - more noisy
-            eta_string = None
-            if self._last_write is not None:
-                estimate_iter_time = (time.perf_counter() - self._last_write[1]) / (
-                    iteration - self._last_write[0]
-                )
-                eta_seconds = estimate_iter_time * (self._max_iter - iteration - 1)
-                eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
-            self._last_write = (iteration, time.perf_counter())
-            return eta_string
-
     def write(self):
         storage = get_event_storage()
         iteration = storage.iter
-        if iteration == self._max_iter:
+        if iteration in [self._max_iter, self._early_exit_iter]:
             # This hook only reports training progress (loss, ETA, etc) but not other data,
             # therefore do not write anything after training succeeds, even if this method
             # is called.
@@ -309,7 +287,12 @@ class CustomCommonMetricPrinter(CommonMetricPrinter):
         ]
         lrs = "  ".join(lr_strs) if len(lr_strs) > 0 else "lr: N/A"
 
-        eta_string = self._get_eta(storage)
+        try:
+            # We log "eta_seconds" via ETAHook
+            eta_seconds = storage.history("eta_seconds").latest()
+            eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
+        except KeyError:
+            eta_string = "N/A"
 
         if torch.cuda.is_available():
             max_mem_mb = torch.cuda.max_memory_allocated() / 1024.0 / 1024.0

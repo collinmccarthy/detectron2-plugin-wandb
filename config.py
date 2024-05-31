@@ -74,22 +74,25 @@ def _add_mmdet_config(cfg):
     # Used by CustomAMPTrainer / CustomSimpleTrainer via EpochTrainerMixin (train_loop.py)
     cfg.SOLVER.EARLY_EXIT_ITER = None
     cfg.SOLVER.EARLY_EXIT_EPOCHS = None
+    cfg.SOLVER.SLURM_REQUEUE_NUM_EPOCHS = None
 
     # Only latest 2 checkpoints by default
     cfg.SOLVER.CHECKPOINT_MAX_KEEP = 2
     cfg.SOLVER.CHECKPOINT_BEST_METRICS = ["panoptic_seg/PQ", "sem_seg/mIoU", "bbox/AP", "segm/AP"]
-    cfg.SOLVER.CHECKPOINT_BEST_METRICS_WANDB_SAVE = [
-        True,
-        False,
-        False,
-        False,
-    ]  # TODO: Update to strs like best metrics above
+    cfg.SOLVER.CHECKPOINT_BEST_METRICS_WANDB_SAVE = ["panoptic_seg/PQ"]
 
     # Allow us to pass in epochs for SOLVER.MAX_ITER, TEST.EVAL_PERIOD, SOLVER.CHECKPOINT_PERIOD
     # We'll calculate iter-based values in CustomTrainer.__init__() (train_net_custom.py)
     cfg.SOLVER.MAX_EPOCHS = None  # Converted to SOLVER.MAX_ITER
     cfg.TEST.EVAL_PERIOD_EPOCHS = None  # Converted to TEST.EVAL_PERIOD
     cfg.SOLVER.CHECKPOINT_PERIOD_EPOCHS = None  # Converted to SOLVER.CHECKPOINT_PERIOD
+
+    # Support FP16 testing (necessary for Mapillary Vistas)
+    cfg.TEST.EVAL_FP16 = False
+
+    # Support passing in a list of epochs/iters for eval, on top of EVAL_PERIOD_EPOCHS
+    cfg.TEST.EVAL_EXPLICIT_EPOCHS = []
+    cfg.TEST.EVAL_EXPLICIT_ITERS = []
 
     # For DATALOADER.SAMPLER_TRAIN == RandomSubsetEpochTrainingSampler
     cfg.DATALOADER.TRAIN_RANDOM_SUBSET_RATIO = None
@@ -119,6 +122,12 @@ def update_config_epochs(cfg: CN, steps_per_epoch: int):
         cfg=cfg,
         epoch_key="TEST.EVAL_PERIOD_EPOCHS",
         iter_key="TEST.EVAL_PERIOD",
+        steps_per_epoch=steps_per_epoch,
+    )
+    _update_iter_from_epochs(
+        cfg=cfg,
+        epoch_key="TEST.EVAL_EXPLICIT_EPOCHS",
+        iter_key="TEST.EVAL_EXPLICIT_ITERS",
         steps_per_epoch=steps_per_epoch,
     )
     _update_iter_from_epochs(
@@ -208,10 +217,16 @@ def _update_model_config(cfg, world_size: int):
 def _update_iter_from_epochs(cfg: CN, epoch_key: str, iter_key: str, steps_per_epoch: int):
     epoch_val = get_config_value(cfg=cfg, key=epoch_key)
     if epoch_val is not None:
-        assert epoch_val > 0, f"Expected cfg.{epoch_key} > 0, found cfg.{epoch_key}={epoch_val}"
+        if isinstance(epoch_val, (tuple, list)):
+            if not all([v > 0 for v in epoch_val]):
+                assert False, f"Expected cfg.{epoch_key} > 0, found cfg.{epoch_key}={epoch_val}"
+            new_iter_val = [int(v * steps_per_epoch) for v in epoch_val]
+        else:
+            assert epoch_val > 0, f"Expected cfg.{epoch_key} > 0, found cfg.{epoch_key}={epoch_val}"
+            new_iter_val = int(epoch_val * steps_per_epoch)
+
         iter_val = get_config_value(cfg=cfg, key=iter_key)
-        new_iter_val = int(epoch_val * steps_per_epoch)
-        if iter_val not in [0, -1, None]:
+        if iter_val not in [0, -1, None, list(), tuple()]:
             logger.warning(
                 f"Found both cfg.{epoch_key}={epoch_val} and cfg.{iter_key}={iter_val}."
                 f" Setting cfg.{iter_key} -> {epoch_val} epochs * {steps_per_epoch} steps per epoch"
