@@ -577,8 +577,13 @@ class CustomTrainerMixin:
                     logger.info(
                         f"Succesfully finished training for {max_iter} iter. Calling after_train()."
                     )
-                # Only mark as preempting if requeuing
-                CustomWandbWriter.close_wandb(exit_code=0, preempting=early_exit)
+                    exit_code = 0
+                    preempting = early_exit
+                else:
+                    exit_code = 1
+                    preempting = False
+
+                CustomWandbWriter.close_wandb(exit_code=exit_code, preempting=preempting)
                 self.after_train()
 
         # comm.synchronize()  # If non-main process leaves early, torchrun may terminate main?

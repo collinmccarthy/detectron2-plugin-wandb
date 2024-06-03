@@ -109,6 +109,8 @@ def _add_mmdet_config(cfg):
     # For restarting run in debug mode
     cfg.RESTART_RUN = False
 
+    # (Optional) Add datasets dir being used, so it's clear from looking at config files
+    cfg.DETECTRON2_DATASETS = os.environ.get('DETECTRON2_DATASETS', None)
 
 def update_config_epochs(cfg: CN, steps_per_epoch: int):
     cfg.defrost()
@@ -269,7 +271,13 @@ def parse_dist_url(dist_url: str, num_machines: int) -> Tuple[str, int]:
 def parse_args():
     parser = default_argument_parser()
 
-    # Note: DO NOT pass in manually, only using b/c torchrun passes it in (and we can test for that)
+    parser.add_argument(
+        "--detectron2-datasets",
+        "--detectron2_datasets",
+        type=str,
+        default=None,
+        help="Override DETECTRON2_DATASETS environment variable for top-level data directory",
+    )
     parser.add_argument(
         "--auto-workers",
         "--auto_workers",
@@ -278,6 +286,10 @@ def parse_args():
         help="Override DATALOADER.NUM_WORKERS with maximum CPUs per GPU on the machine",
     )
     args = parser.parse_args()
+
+    # Override data dir
+    if args.detectron2_datasets is not None:
+        os.environ["DETECTRON2_DATASETS"] = args.detectron2_datasets
 
     # Override detectron DDP args with torchrun vars if they exist, just for consistency
     nproc_per_node = os.environ.get("LOCAL_WORLD_SIZE", None)
@@ -297,4 +309,4 @@ def parse_args():
     if dist_addr is not None and dist_port is not None:
         args.dist_url = f"tcp://{dist_addr}:{dist_port}"
 
-    return parser.parse_args()
+    return args
