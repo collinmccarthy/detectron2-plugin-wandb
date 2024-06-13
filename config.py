@@ -104,13 +104,14 @@ def _add_mmdet_config(cfg):
 
     # Other dataloader defaults not used in d2
     cfg.DATALOADER.PERSISTENT_WORKERS = True  # This with pq_compute_multi_core() can slow us down?
-    cfg.DATALOADER.PIN_MEMORY = True
+    cfg.DATALOADER.PIN_MEMORY = False  # True can cause issues on our servers occasionally
 
     # For restarting run in debug mode
     cfg.RESTART_RUN = False
 
     # (Optional) Add datasets dir being used, so it's clear from looking at config files
-    cfg.DETECTRON2_DATASETS = os.environ.get('DETECTRON2_DATASETS', None)
+    cfg.DETECTRON2_DATASETS = os.environ.get("DETECTRON2_DATASETS", None)
+
 
 def update_config_epochs(cfg: CN, steps_per_epoch: int):
     cfg.defrost()
@@ -284,6 +285,12 @@ def parse_args():
         action="store_true",
         default=False,
         help="Override DATALOADER.NUM_WORKERS with maximum CPUs per GPU on the machine",
+    )
+    parser.add_argument(
+        "--test",
+        default=False,
+        action="store_true",
+        help="Run testing instead of training",
     )
     args = parser.parse_args()
 

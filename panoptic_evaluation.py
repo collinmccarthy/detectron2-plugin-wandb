@@ -38,13 +38,13 @@ def pq_compute(gt_json_file, pred_json_file, gt_folder=None, pred_folder=None, p
         pred_folder = pred_json_file.replace(".json", "")
     categories = {el["id"]: el for el in gt_json["categories"]}
 
-    print("Evaluation panoptic segmentation metrics:")
-    print("Ground truth:")
-    print("\tSegmentation folder: {}".format(gt_folder))
-    print("\tJSON file: {}".format(gt_json_file))
-    print("Prediction:")
-    print("\tSegmentation folder: {}".format(pred_folder))
-    print("\tJSON file: {}".format(pred_json_file))
+    logger.info("Evaluation panoptic segmentation metrics:")
+    logger.info("Ground truth:")
+    logger.info("\tSegmentation folder: {}".format(gt_folder))
+    logger.info("\tJSON file: {}".format(gt_json_file))
+    logger.info("Prediction:")
+    logger.info("\tSegmentation folder: {}".format(pred_folder))
+    logger.info("\tJSON file: {}".format(pred_json_file))
 
     if not os.path.isdir(gt_folder):
         raise Exception("Folder {} with ground truth segmentations doesn't exist".format(gt_folder))
@@ -69,11 +69,11 @@ def pq_compute(gt_json_file, pred_json_file, gt_folder=None, pred_folder=None, p
         results[name], per_class_results = pq_stat.pq_average(categories, isthing=isthing)
         if name == "All":
             results["per_class"] = per_class_results
-    print("{:10s}| {:>5s}  {:>5s}  {:>5s} {:>5s}".format("", "PQ", "SQ", "RQ", "N"))
-    print("-" * (10 + 7 * 4))
+    logger.info("{:10s}| {:>5s}  {:>5s}  {:>5s} {:>5s}".format("", "PQ", "SQ", "RQ", "N"))
+    logger.info("-" * (10 + 7 * 4))
 
     for name, _isthing in metrics:
-        print(
+        logger.info(
             "{:10s}| {:5.1f}  {:5.1f}  {:5.1f} {:5d}".format(
                 name,
                 100 * results[name]["pq"],
@@ -84,7 +84,7 @@ def pq_compute(gt_json_file, pred_json_file, gt_folder=None, pred_folder=None, p
         )
 
     t_delta = time.time() - start_time
-    print("Time elapsed: {:0.2f} seconds".format(t_delta))
+    logger.info("Time elapsed: {:0.2f} seconds".format(t_delta))
 
     return results
 
@@ -95,7 +95,9 @@ def pq_compute_multi_core(matched_annotations_list, gt_folder, pred_folder, cate
     """
     cpu_num = multiprocessing.cpu_count()
     annotations_split = np.array_split(matched_annotations_list, cpu_num)
-    print("Number of cores: {}, images per core: {}".format(cpu_num, len(annotations_split[0])))
+    logger.info(
+        "Number of cores: {}, images per core: {}".format(cpu_num, len(annotations_split[0]))
+    )
     workers = multiprocessing.Pool(processes=cpu_num)
     processes = []
     for proc_id, annotation_set in enumerate(annotations_split):
