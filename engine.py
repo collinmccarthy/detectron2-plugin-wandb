@@ -70,7 +70,7 @@ def launch(main_func: Callable) -> None:
                 break
 
             except ProcessRaisedException as e:
-                if "Address already in use" in e.msg:
+                if "Address already in use" in str(e):
                     print(
                         f"Distributed url {dist_url}:{dist_port} is not available."
                         f" Incrementing port and re-trying."

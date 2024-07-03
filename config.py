@@ -292,7 +292,29 @@ def parse_args():
         action="store_true",
         help="Run testing instead of training",
     )
+    parser.add_argument(
+        "--nnodes", type=int, help="Dummy arg, used with torchrun, ignored for detectron2"
+    )
+    parser.add_argument(
+        "--nproc-per-node",
+        "--nproc_per_node",
+        type=int,
+        default="Dummy arg, used with torchrun, ignored for detectron2. Use --num-gpus instead.",
+    )
+
     args = parser.parse_args()
+
+    if args.nnodes is not None and args.nnodes != 1:
+        raise RuntimeError(
+            f"Found --nnodes={args.nnodes}. Expected 1 or None for detectron2. Multi-node DDP must"
+            f" use torchrun and manually launch on each node."
+        )
+
+    if args.nproc_per_node is not None and args.nproc_per_node != args.num_gpus:
+        raise RuntimeError(
+            f"Found --nproc-per-node={args.nproc_per_node}. This is ignored in detectron2 and must"
+            f" equal --num-gpus={args.num_gpus}."
+        )
 
     # Override data dir
     if args.detectron2_datasets is not None:
